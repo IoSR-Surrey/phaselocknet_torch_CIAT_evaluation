@@ -1,3 +1,11 @@
+# Evaluation of phaselocknet_torch
+
+This repository is a fork of [phaselocknet_torch](https://github.com/msaddler/phaselocknet_torch) used to evaluate the model for the purposes of the CIAT project. [`requirements.txt`](requirements.txt) file was modified to include Python dependencies that were needed for running this repository on a MacBook Pro. [`DEMO_RD.ipynb`](DEMO_RD.ipynb) is a Jupyter notebook that loads and runs the model on a binauralised noise burst stimulus.
+
+The model weights used in this repository were downloaded from the [phaselocknet_torch Google Drive](https://drive.google.com/drive/folders/1qcW_Z5iX45dObOqbiD_Yo1dLqvVyiqoH?usp=sharing) and are the same as those used in the original phaselocknet_torch repository.
+
+The rest of this README is from the original phaselocknet_torch repository.
+
 ## phaselocknet_torch
 
 Minimal PyTorch implementation of the models from ["Models optimized for real-world tasks reveal the task-dependent necessity of precise temporal coding in hearing"](https://doi.org/10.1038/s41467-024-54700-5) by Mark R. Saddler and Josh H. McDermott (2024, Nature Communications). The primary repository accompanying this work ([phaselocknet](https://github.com/msaddler/phaselocknet)) implements the models in TensorFlow and also includes code to run analyses and generate figures.
