@@ -95,20 +95,30 @@ def _build_frontal_elevation0_prior(num_classes):
 
 
 def _prepare_input(signal, signal_sr, model, target_sr):
-    """Convert MATLAB signal (n_samples, n_channels) to model input tensor."""
+    """
+    Convert MATLAB signal to model input tensor.
+
+    Supported input shapes:
+    - (n_samples, n_channels)
+    - (n_positions, n_samples, n_channels)
+    """
     print(
         "[phaselocknet_evaluate_CIAT] preparing input "
         f"(signal_sr={signal_sr}, target_sr={target_sr})"
     )
     x = np.asarray(signal, dtype=np.float32)
-    if x.ndim != 2:
+    if x.ndim == 2:
+        # Single example -> add batch dimension.
+        x = torch.from_numpy(x).unsqueeze(0)
+    elif x.ndim == 3:
+        # Batched examples from MATLAB.
+        x = torch.from_numpy(x)
+    else:
         raise ValueError(
-            f"Expected shape (n_samples, n_channels), got shape {x.shape}."
+            "Expected shape (n_samples, n_channels) or "
+            f"(n_positions, n_samples, n_channels), got shape {x.shape}."
         )
     print(f"[phaselocknet_evaluate_CIAT] input numpy shape: {x.shape}")
-
-    # Batch dimension -> (1, n_samples, n_channels)
-    x = torch.from_numpy(x).unsqueeze(0)
 
     if signal_sr != target_sr:
         print(
@@ -148,14 +158,16 @@ def _prepare_input(signal, signal_sr, model, target_sr):
     return x
 
 
-def estimate_angle_from_signal(binaural_signal, signal_sr=50000, dir_model=None):
+def estimate_angle_from_signal(
+    binaural_signal, signal_sr=50000, dir_model=None, eval_batch_size=1
+):
     """
-    Run PhaselockNet on one binaural signal.
+    Run PhaselockNet on one or many binaural signals.
 
     Returns a dict with:
-    - predicted_class_index: argmax class index under prior
-    - argmax_azimuth_deg: azimuth mapped from predicted class
-    - expected_azimuth_deg: posterior expectation in degrees under prior
+    - predicted_class_index: shape (n_positions,)
+    - argmax_azimuth_deg: shape (n_positions,)
+    - expected_azimuth_deg: shape (n_positions,)
     """
     print("[phaselocknet_evaluate_CIAT] stage: resolve model directory")
     dir_model = _resolve_model_dir(model_dir_override=dir_model)
@@ -184,32 +196,50 @@ def estimate_angle_from_signal(binaural_signal, signal_sr=50000, dir_model=None)
         signal_sr=int(signal_sr),
         model=model,
         target_sr=sr_model,
-    ).to(device)
-
-    print("[phaselocknet_evaluate_CIAT] stage: forward inference")
-    with torch.no_grad():
-        logits_by_task = model(x)
-
-    # Use the first task head when a multi-head dict is returned.
-    first_task = sorted(logits_by_task.keys())[0]
-    probs = torch.nn.functional.softmax(logits_by_task[first_task], dim=1)[0]
-    probs_np = probs.detach().cpu().numpy()
-    print(
-        "[phaselocknet_evaluate_CIAT] stage: posterior processing "
-        f"(num_classes={probs_np.shape[0]})"
     )
 
-    prior, azim_deg_all = _build_frontal_elevation0_prior(num_classes=probs_np.shape[0])
+    print(
+        "[phaselocknet_evaluate_CIAT] stage: forward inference "
+        f"(eval_batch_size={eval_batch_size})"
+    )
+    num_positions = int(x.shape[0])
+    logits_chunks = []
+    with torch.no_grad():
+        for i0 in range(0, num_positions, int(eval_batch_size)):
+            i1 = min(i0 + int(eval_batch_size), num_positions)
+            print(
+                "[phaselocknet_evaluate_CIAT] forward chunk "
+                f"{i0}:{i1} / {num_positions}"
+            )
+            x_chunk = x[i0:i1].to(device)
+            logits_chunk_by_task = model(x_chunk)
+            logits_chunks.append(logits_chunk_by_task)
+
+    # Use the first task head when a multi-head dict is returned.
+    first_task = sorted(logits_chunks[0].keys())[0]
+    logits = torch.cat(
+        [chunk[first_task].detach().cpu() for chunk in logits_chunks],
+        dim=0,
+    )
+    probs = torch.nn.functional.softmax(logits, dim=1)
+    probs_np = probs.detach().cpu().numpy()
+    num_positions = int(probs_np.shape[0])
+    print(
+        "[phaselocknet_evaluate_CIAT] stage: posterior processing "
+        f"(num_positions={num_positions}, num_classes={probs_np.shape[1]})"
+    )
+
+    prior, azim_deg_all = _build_frontal_elevation0_prior(num_classes=probs_np.shape[1])
     posterior = probs_np * prior
 
-    pred_idx = int(ulp.probs_to_label(probs_np.reshape(1, -1), prior=prior)[0])
-    argmax_azimuth_deg = float(azim_deg_all[pred_idx])
+    pred_idx = ulp.probs_to_label(probs_np, prior=prior).astype(int)
+    argmax_azimuth_deg = azim_deg_all[pred_idx].astype(float)
 
-    posterior_sum = float(np.sum(posterior))
-    if posterior_sum <= 0:
+    posterior_sum = np.sum(posterior, axis=1, keepdims=True)
+    if np.any(posterior_sum <= 0):
         raise ValueError("Prior-weighted posterior sums to zero.")
     posterior = posterior / posterior_sum
-    expected_azimuth_deg = float(np.sum(posterior * azim_deg_all))
+    expected_azimuth_deg = np.sum(posterior * azim_deg_all.reshape(1, -1), axis=1)
     print("[phaselocknet_evaluate_CIAT] stage: completed inference")
 
     return {
@@ -227,7 +257,10 @@ def _parse_args():
         "--signal-npy",
         type=str,
         default=None,
-        help="Optional path to .npy array with shape (n_samples, n_channels).",
+        help=(
+            "Optional path to .npy array with shape (n_samples, n_channels) "
+            "or (n_positions, n_samples, n_channels)."
+        ),
     )
     parser.add_argument(
         "--signal-sr",
@@ -243,6 +276,12 @@ def _parse_args():
             "Optional explicit model directory containing config.json, "
             "arch.json, and ckpt_BEST.pt."
         ),
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=1,
+        help="Mini-batch size used during forward inference.",
     )
     return parser.parse_args()
 
@@ -261,6 +300,7 @@ def main():
         signal = globals()["binaural_signal"]
         signal_sr = int(globals().get("signal_sr", args.signal_sr))
         dir_model = globals().get("dir_model", args.dir_model)
+        eval_batch_size = int(globals().get("eval_batch_size", args.eval_batch_size))
     elif args.signal_npy is not None:
         print(
             "[phaselocknet_evaluate_CIAT] input source: --signal-npy "
@@ -269,6 +309,7 @@ def main():
         signal = np.load(args.signal_npy)
         signal_sr = int(args.signal_sr)
         dir_model = args.dir_model
+        eval_batch_size = int(args.eval_batch_size)
     else:
         raise ValueError(
             "Provide input via MATLAB global `binaural_signal` or CLI `--signal-npy`."
@@ -278,19 +319,25 @@ def main():
         binaural_signal=signal,
         signal_sr=signal_sr,
         dir_model=dir_model,
+        eval_batch_size=eval_batch_size,
     )
+    # Export one MATLAB-friendly container from a single script execution.
+    result = {
+        "predicted_class_index": result["predicted_class_index"].tolist(),
+        "argmax_azimuth_deg": result["argmax_azimuth_deg"].tolist(),
+        "expected_azimuth_deg": result["expected_azimuth_deg"].tolist(),
+    }
     print("[phaselocknet_evaluate_CIAT] exporting outputs to globals")
+    globals()["result"] = result
     globals()["estimated_class_index"] = result["predicted_class_index"]
     globals()["estimated_angle"] = result["argmax_azimuth_deg"]
     globals()["estimated_angle_expected"] = result["expected_azimuth_deg"]
-    print(
-        "estimated_class_index={idx}, estimated_angle={argmax_deg}, "
-        "estimated_angle_expected={expected_deg}".format(
-            idx=result["predicted_class_index"],
-            argmax_deg=result["argmax_azimuth_deg"],
-            expected_deg=result["expected_azimuth_deg"],
+    if len(result["predicted_class_index"]) == 1:
+        print(
+            f"estimated_class_index={result['predicted_class_index'][0]}",
+            f"estimated_angle={result['argmax_azimuth_deg'][0]}",
+            f"estimated_angle_expected={result['expected_azimuth_deg']}",
         )
-    )
 
 
 if __name__ == "__main__":
